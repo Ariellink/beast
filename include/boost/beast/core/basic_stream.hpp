@@ -356,6 +356,22 @@ public:
         ! std::is_constructible<RatePolicy, Arg0>::value>::type>
     explicit
     basic_stream(Arg0&& argo, Args&&... args);
+
+
+    /** Constructor
+     *
+     * A constructor that rebinds the executor.
+     *
+     * @tparam Executor The new executor
+     * @param lhs The original socket to be rebound.
+     */
+    template<class Executor_>
+    explicit
+    basic_stream(basic_stream<Protocol, Executor_, RatePolicy> && other);
+
+
+    template<typename, typename, typename>
+    friend class basic_stream;
 #endif
 
     /** Constructor
