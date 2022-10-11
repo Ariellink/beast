@@ -20,11 +20,19 @@
 #include <boost/beast/ssl.hpp>
 #include <boost/beast/websocket.hpp>
 #include <boost/beast/version.hpp>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/bind_executor.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/deferred.hpp>
+#include <boost/asio/detached.hpp>
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/experimental/parallel_group.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/make_unique.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <boost/optional.hpp>
 #include <algorithm>
 #include <cstdlib>
@@ -44,6 +52,11 @@ namespace websocket = beast::websocket;         // from <boost/beast/websocket.h
 namespace net = boost::asio;                    // from <boost/asio.hpp>
 namespace ssl = boost::asio::ssl;               // from <boost/asio/ssl.hpp>
 using tcp = boost::asio::ip::tcp;               // from <boost/asio/ip/tcp.hpp>
+
+using executor_type = net::io_context::executor_type;
+using executor_with_default = net::as_tuple_t<net::use_awaitable_t<executor_type>>::executor_with_default<executor_type>;
+
+
 
 // Return a reasonable mime type based on the extension of a file.
 beast::string_view
@@ -240,6 +253,36 @@ fail(beast::error_code ec, char const* what)
 
     std::cerr << what << ": " << ec.message() << "\n";
 }
+
+// A simple helper for cancellation_slot
+struct cancellation_signals
+{
+    std::list<net::cancellation_signal> sigs;
+    std::mutex mtx;
+    void emit(net::cancellation_type ct = net::cancellation_type::all)
+    {
+        std::lock_guard<std::mutex> _(mtx);
+
+        for (auto & sig : sigs)
+            sig.emit(ct);
+    }
+
+    net::cancellation_slot slot()
+    {
+        std::lock_guard<std::mutex> _(mtx);
+
+        auto itr = std::find_if(sigs.begin(), sigs.end(),
+                             [](net::cancellation_signal & sig)
+                             {
+                                return !sig.slot().has_handler();
+                             });
+
+        if (itr != sigs.end())
+            return itr->slot();
+        else
+            return sigs.emplace_back().slot();
+    }
+};
 
 //------------------------------------------------------------------------------
 
@@ -825,100 +868,237 @@ public:
     }
 };
 
-// Accepts incoming connections and launches the sessions
-class listener : public std::enable_shared_from_this<listener>
+template<typename Stream>
+net::awaitable<void, executor_type> do_eof(Stream & stream)
 {
-    net::io_context& ioc_;
-    ssl::context& ctx_;
-    tcp::acceptor acceptor_;
-    std::shared_ptr<std::string const> doc_root_;
+    beast::error_code ec;
+    stream.socket().shutdown(tcp::socket::shutdown_send, ec);
+    co_return ;
+}
 
-public:
-    listener(
-        net::io_context& ioc,
-        ssl::context& ctx,
-        tcp::endpoint endpoint,
-        std::shared_ptr<std::string const> const& doc_root)
-        : ioc_(ioc)
-        , ctx_(ctx)
-        , acceptor_(net::make_strand(ioc))
-        , doc_root_(doc_root)
+template<typename Stream>
+BOOST_ASIO_NODISCARD net::awaitable<void, executor_type>
+do_eof(beast::ssl_stream<Stream> & stream)
+{
+    co_await stream.async_shutdown();
+}
+
+
+template<typename Stream, typename Body, typename Allocator>
+BOOST_ASIO_NODISCARD net::awaitable<void, executor_type>
+run_websocket_session(Stream & stream,
+                      beast::flat_buffer & buffer,
+                      http::request<Body, http::basic_fields<Allocator>> req,
+                      const std::shared_ptr<std::string const> & doc_root)
+{
+    beast::websocket::stream<Stream&> ws{stream};
+
+    // Set suggested timeout settings for the websocket
+    ws.set_option(
+            websocket::stream_base::timeout::suggested(
+                    beast::role_type::server));
+
+    // Set a decorator to change the Server of the handshake
+    ws.set_option(
+            websocket::stream_base::decorator(
+                    [](websocket::response_type& res)
+                    {
+                        res.set(http::field::server,
+                                std::string(BOOST_BEAST_VERSION_STRING) +
+                            " advanced-server-flex");
+                    }));
+
+    // Accept the websocket handshake
+    auto [ec] = co_await ws.async_accept(req);
+    if (ec)
+        co_return fail(ec, "accept");
+
+    while (true)
     {
-        beast::error_code ec;
 
-        // Open the acceptor
-        acceptor_.open(endpoint.protocol(), ec);
-        if(ec)
+
+        // Read a message
+        std::size_t bytes_transferred = 0u;
+        std::tie(ec, bytes_transferred) = co_await ws.async_read(buffer);
+
+        // This indicates that the websocket_session was closed
+        if (ec == websocket::error::closed)
+            co_return;
+        if (ec)
+            co_return fail(ec, "read");
+
+        ws.text(ws.got_text());
+        std::tie(ec, bytes_transferred) = co_await ws.async_write(buffer.data());
+
+        if (ec)
+            co_return fail(ec, "write");
+
+        // Clear the buffer
+        buffer.consume(buffer.size());
+    }
+}
+
+
+template<typename Stream>
+BOOST_ASIO_NODISCARD net::awaitable<void, executor_type>
+run_session(Stream & stream, beast::flat_buffer & buffer, const std::shared_ptr<std::string const> & doc_root)
+{
+    http::request_parser<http::string_body> parser;
+    // Apply a reasonable limit to the allowed size
+    // of the body in bytes to prevent abuse.
+    parser.body_limit(10000);
+
+    auto [ec, bytes_transferred] = co_await http::async_read(stream, buffer, parser);
+
+    if(ec == http::error::end_of_stream)
+        co_await do_eof(stream);
+
+    if(ec)
+        co_return fail(ec, "read");
+
+
+
+    while ((co_await net::this_coro::cancellation_state).cancelled() == net::cancellation_type::none)
+    {
+        if(websocket::is_upgrade(parser.get()))
         {
-            fail(ec, "open");
-            return;
+            // Disable the timeout.
+            // The websocket::stream uses its own timeout settings.
+            beast::get_lowest_layer(stream).expires_never();
+
+            co_await run_websocket_session(stream, buffer, parser.release(), doc_root);
+            co_return ;
         }
 
-        // Allow address reuse
-        acceptor_.set_option(net::socket_base::reuse_address(true), ec);
-        if(ec)
+        // we follow a different strategy then the other example: instead of queue responses,
+        // we always to one read & write in parallel.
+
+        auto res = handle_request(*doc_root, parser.release());
+        if (!res.keep_alive())
         {
-            fail(ec, "set_option");
-            return;
+            http::message_generator msg{std::move(res)};
+            auto [ec, sz] = co_await beast::async_write(stream, std::move(msg));
+            if (ec)
+                fail(ec, "write");
+            co_return ;
         }
 
-        // Bind to the server address
-        acceptor_.bind(endpoint, ec);
-        if(ec)
-        {
-            fail(ec, "bind");
-            return;
-        }
+        http::message_generator msg{std::move(res)};
 
-        // Start listening for connections
-        acceptor_.listen(
+        auto [_, ec_r, sz_r, ec_w, sz_w ] =
+                co_await net::experimental::make_parallel_group(
+                    http::async_read(stream, buffer, parser, net::deferred),
+                    beast::async_write(stream, std::move(msg), net::deferred))
+                        .async_wait(net::experimental::wait_for_all(),
+                                    net::as_tuple(net::use_awaitable_t<executor_type>{}));
+
+        if (ec_r)
+            co_return fail(ec_r, "read");
+
+        if (ec_w)
+            co_return fail(ec_w, "write");
+
+    }
+
+
+}
+
+BOOST_ASIO_NODISCARD net::awaitable<void, executor_type>
+detect_session(typename beast::tcp_stream::rebind_executor<executor_with_default>::other stream,
+               net::ssl::context & ctx,
+               std::shared_ptr<std::string const> doc_root)
+{
+    beast::flat_buffer buffer;
+
+    // Set the timeout.
+    stream.expires_after(std::chrono::seconds(30));
+    // on_run
+    auto [ec, result] = co_await beast::async_detect_ssl(stream, buffer);
+    // on_detect
+    if (ec)
+        co_return fail(ec, "detect");
+
+    if(result)
+    {
+        using stream_type = typename beast::tcp_stream::rebind_executor<executor_with_default>::other;
+        beast::ssl_stream<stream_type> ssl_stream{std::move(stream), ctx};
+        auto [ec, bytes_used] = co_await ssl_stream.async_handshake(net::ssl::stream_base::server, buffer.data());
+
+        if(ec)
+            co_return fail(ec, "handshake");
+
+        buffer.consume(bytes_used);
+        co_await run_session(ssl_stream, buffer, doc_root);
+    }
+    else
+        co_await run_session(stream, buffer, doc_root);
+
+
+}
+
+bool init_listener(typename tcp::acceptor::rebind_executor<executor_with_default>::other & acceptor,
+                   const tcp::endpoint &endpoint)
+{
+    beast::error_code ec;
+    // Open the acceptor
+    acceptor.open(endpoint.protocol(), ec);
+    if(ec)
+    {
+        fail(ec, "open");
+        return false;
+    }
+
+    // Allow address reuse
+    acceptor.set_option(net::socket_base::reuse_address(true), ec);
+    if(ec)
+    {
+        fail(ec, "set_option");
+        return false;
+    }
+
+    // Bind to the server address
+    acceptor.bind(endpoint, ec);
+    if(ec)
+    {
+        fail(ec, "bind");
+        return false;
+    }
+
+    // Start listening for connections
+    acceptor.listen(
             net::socket_base::max_listen_connections, ec);
-        if(ec)
-        {
-            fail(ec, "listen");
-            return;
-        }
-    }
-
-    // Start accepting incoming connections
-    void
-    run()
+    if(ec)
     {
-        do_accept();
+        fail(ec, "listen");
+        return false;
     }
+    return true;
 
-private:
-    void
-    do_accept()
+}
+
+// Accepts incoming connections and launches the sessions.
+BOOST_ASIO_NODISCARD net::awaitable<void, executor_type>
+            listen(ssl::context& ctx,
+                   tcp::endpoint endpoint,
+                   std::shared_ptr<std::string const> doc_root,
+                   cancellation_signals & sig)
+{
+    typename tcp::acceptor::rebind_executor<executor_with_default>::other acceptor{co_await net::this_coro::executor};
+    if (!init_listener(acceptor, endpoint))
+        co_return;
+
+    while ((co_await net::this_coro::cancellation_state).cancelled() == net::cancellation_type::none)
     {
-        // The new connection gets its own strand
-        acceptor_.async_accept(
-            net::make_strand(ioc_),
-            beast::bind_front_handler(
-                &listener::on_accept,
-                shared_from_this()));
+        auto [ec, sock] = co_await acceptor.async_accept();
+        const auto exec = sock.get_executor();
+        using stream_type = typename beast::tcp_stream::rebind_executor<executor_with_default>::other;
+        if (!ec)
+            // We dont't need a strand, since the awaitable is an implicit strand.
+            net::co_spawn(exec,
+                          detect_session(stream_type(std::move(sock)), ctx, doc_root),
+                          net::bind_cancellation_slot(sig.slot(), net::detached));
     }
-
-    void
-    on_accept(beast::error_code ec, tcp::socket socket)
-    {
-        if(ec)
-        {
-            fail(ec, "accept");
-        }
-        else
-        {
-            // Create the detector http_session and run it
-            std::make_shared<detect_session>(
-                std::move(socket),
-                ctx_,
-                doc_root_)->run();
-        }
-
-        // Accept another connection
-        do_accept();
-    }
-};
+}
 
 //------------------------------------------------------------------------------
 
@@ -928,9 +1108,9 @@ int main(int argc, char* argv[])
     if (argc != 5)
     {
         std::cerr <<
-            "Usage: advanced-server-flex <address> <port> <doc_root> <threads>\n" <<
+            "Usage: advanced-server-flex-awaitable <address> <port> <doc_root> <threads>\n" <<
             "Example:\n" <<
-            "    advanced-server-flex 0.0.0.0 8080 . 1\n";
+            "    advanced-server-flex-awaitable 0.0.0.0 8080 . 1\n";
         return EXIT_FAILURE;
     }
     auto const address = net::ip::make_address(argv[1]);
@@ -947,22 +1127,30 @@ int main(int argc, char* argv[])
     // This holds the self-signed certificate used by the server
     load_server_certificate(ctx);
 
-    // Create and launch a listening port
-    std::make_shared<listener>(
-        ioc,
-        ctx,
-        tcp::endpoint{address, port},
-        doc_root)->run();
+    // Cancellation-signal for SIGINT
+    cancellation_signals cancellation;
+
+    // Create and launch a listening routine
+    net::co_spawn(
+            ioc,
+            listen(ctx, tcp::endpoint{address, port}, doc_root, cancellation),
+            net::bind_cancellation_slot(cancellation.slot(), net::detached));
+
 
     // Capture SIGINT and SIGTERM to perform a clean shutdown
     net::signal_set signals(ioc, SIGINT, SIGTERM);
     signals.async_wait(
-        [&](beast::error_code const&, int)
+        [&](beast::error_code const&, int sig)
         {
-            // Stop the `io_context`. This will cause `run()`
-            // to return immediately, eventually destroying the
-            // `io_context` and all of the sockets in it.
-            ioc.stop();
+            if (sig == SIGINT)
+                cancellation.emit(net::cancellation_type::all);
+            else
+            {
+                // Stop the `io_context`. This will cause `run()`
+                // to return immediately, eventually destroying the
+                // `io_context` and all of the sockets in it.
+                ioc.stop();
+            }
         });
 
     // Run the I/O service on the requested number of threads
